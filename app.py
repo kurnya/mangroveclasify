@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageDraw, ImageFont, UnidentifiedImageError
 from tensorflow.keras.applications.densenet import preprocess_input
 from tensorflow.keras.models import load_model
 from tensorflow.keras.preprocessing.image import img_to_array
@@ -29,6 +29,10 @@ MODEL_OPTIONS = {
         "accuracy": "98,15%",
     },
 }
+ANALYSIS_MODES = {
+    "Basic": "Klasifikasi satu gambar utuh.",
+    "Beta": "Klasifikasi grid adaptif dengan rata-rata probabilitas.",
+}
 CLASS_NAMES = ["01 Subur", "02 Terdegradasi", "03 Non-Vegetasi"]
 IMG_SIZE = (224, 224)
 
@@ -48,6 +52,20 @@ CLASS_INFO = {
     "02 Terdegradasi": "Area mangrove dengan vegetasi mulai menurun atau tidak merata.",
     "03 Non-Vegetasi": "Area non-vegetatif seperti tanah terbuka, pasir, lumpur, atau air.",
 }
+
+CLASS_COLORS = {
+    "01 Subur": "#2EAD5B",
+    "02 Terdegradasi": "#D39E2E",
+    "03 Non-Vegetasi": "#D94F4F",
+}
+
+GRID_SIZE_BETA = 16
+GRID_SIZE_CHOICES = list(range(9, 25))
+RECTANGLE_SPLIT_THRESHOLD = 1.15
+MIN_SPLIT_SIDE = 48
+MIN_ISOLATED_REGION_SIZE = 1
+CORRECTION_MIN_NEIGHBOR_SUPPORT = 5
+CORRECTION_DOMINANCE_RATIO = 0.75
 
 
 def css():
@@ -268,8 +286,243 @@ def preprocess_image(uploaded_file):
     return (preview, array), None
 
 
+def split_into_grid(image, grid_size=GRID_SIZE_BETA):
+    width, height = image.size
+    tile_width = width // grid_size
+    tile_height = height // grid_size
+    tiles = []
+
+    for row in range(grid_size):
+        for col in range(grid_size):
+            left = col * tile_width
+            top = row * tile_height
+            right = width if col == grid_size - 1 else (col + 1) * tile_width
+            bottom = height if row == grid_size - 1 else (row + 1) * tile_height
+            tiles.append(image.crop((left, top, right, bottom)))
+
+    return tiles
+
+
+def preprocess_tile(tile_image):
+    tile = tile_image.resize(IMG_SIZE)
+    array = img_to_array(tile)
+    array = np.expand_dims(array, axis=0)
+    return preprocess_input(array)
+
+
+def split_tile_for_inference(tile_image, split_threshold=RECTANGLE_SPLIT_THRESHOLD):
+    width, height = tile_image.size
+
+    if width <= 0 or height <= 0:
+        return [tile_image]
+
+    aspect_ratio = width / height
+    long_side = max(width, height)
+
+    if long_side < MIN_SPLIT_SIDE * 2:
+        return [tile_image]
+
+    if aspect_ratio >= split_threshold:
+        mid = width // 2
+        left = tile_image.crop((0, 0, mid, height))
+        right = tile_image.crop((mid, 0, width, height))
+        return [left, right]
+
+    if (1 / aspect_ratio) >= split_threshold:
+        mid = height // 2
+        top = tile_image.crop((0, 0, width, mid))
+        bottom = tile_image.crop((0, mid, width, height))
+        return [top, bottom]
+
+    return [tile_image]
+
+
+def predict_tile_probabilities(model, tile_image):
+    tile_array = preprocess_tile(tile_image)
+    probabilities = model.predict(tile_array, verbose=0)[0]
+    return np.asarray(probabilities, dtype=np.float32)
+
+
+def predict_tile_probabilities_adaptive(model, tile_image):
+    subtiles = split_tile_for_inference(tile_image)
+    subtile_probs = [predict_tile_probabilities(model, subtile) for subtile in subtiles]
+    stacked = np.vstack(subtile_probs)
+    return stacked.mean(axis=0), len(subtiles)
+
+
+def predict_grid_average(model, image, grid_size=GRID_SIZE_BETA):
+    tiles = split_into_grid(image, grid_size=grid_size)
+    tile_probabilities = []
+    tile_classes = []
+    tile_subtile_counts = []
+
+    for tile in tiles:
+        probs, subtile_count = predict_tile_probabilities_adaptive(model, tile)
+        tile_probabilities.append(probs)
+        tile_classes.append(CLASS_NAMES[int(np.argmax(probs))])
+        tile_subtile_counts.append(subtile_count)
+
+    stacked = np.vstack(tile_probabilities)
+    mean_probabilities = stacked.mean(axis=0)
+    mean_probabilities = mean_probabilities / mean_probabilities.sum()
+    return mean_probabilities, tile_classes, tile_subtile_counts
+
+
+def make_grid_annotation(image, tile_classes, grid_size=GRID_SIZE_BETA):
+    annotated = image.copy().convert("RGBA")
+    overlay = Image.new("RGBA", annotated.size, (255, 255, 255, 0))
+    draw = ImageDraw.Draw(overlay)
+    width, height = annotated.size
+    tile_width = width // grid_size
+    tile_height = height // grid_size
+
+    try:
+        font = ImageFont.truetype("arial.ttf", size=max(10, min(tile_width, tile_height) // 10))
+    except OSError:
+        font = ImageFont.load_default()
+
+    # Group adjacent tiles with the same predicted class into connected regions.
+    visited = set()
+    regions = []
+
+    def tile_bounds(row, col):
+        left = col * tile_width
+        top = row * tile_height
+        right = width if col == grid_size - 1 else (col + 1) * tile_width
+        bottom = height if row == grid_size - 1 else (row + 1) * tile_height
+        return left, top, right, bottom
+
+    for row in range(grid_size):
+        for col in range(grid_size):
+            start_idx = row * grid_size + col
+            if start_idx in visited:
+                continue
+
+            label = tile_classes[start_idx]
+            stack = [(row, col)]
+            visited.add(start_idx)
+            cells = []
+
+            while stack:
+                r, c = stack.pop()
+                idx = r * grid_size + c
+                cells.append((r, c))
+
+                for nr, nc in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)):
+                    if nr < 0 or nc < 0 or nr >= grid_size or nc >= grid_size:
+                        continue
+                    nidx = nr * grid_size + nc
+                    if nidx in visited or tile_classes[nidx] != label:
+                        continue
+                    visited.add(nidx)
+                    stack.append((nr, nc))
+
+            regions.append((label, cells))
+
+    for label, cells in regions:
+        color = CLASS_COLORS[label]
+        left = min(tile_bounds(r, c)[0] for r, c in cells)
+        top = min(tile_bounds(r, c)[1] for r, c in cells)
+        right = max(tile_bounds(r, c)[2] for r, c in cells)
+        bottom = max(tile_bounds(r, c)[3] for r, c in cells)
+        region_count = len(cells)
+
+        fill = tuple(int(color[i : i + 2], 16) for i in (1, 3, 5)) + (55,)
+        draw.rectangle([left, top, right, bottom], fill=fill, outline=color, width=5)
+
+        tag_height = max(16, min(24, tile_height // 4))
+        tag_width = max(64, min(170, right - left - 8))
+        draw.rectangle([left + 4, top + 4, left + 4 + tag_width, top + 4 + tag_height], fill=color)
+        draw.text((left + 8, top + 6), f"{label} ({region_count})", fill="white", font=font)
+
+    combined = Image.alpha_composite(annotated, overlay).convert("RGB")
+    return combined
+
+
+def smooth_tile_classes(tile_classes, grid_size=GRID_SIZE_BETA):
+    labels = list(tile_classes)
+    visited = set()
+
+    def neighbors(r, c):
+        for nr, nc in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)):
+            if 0 <= nr < grid_size and 0 <= nc < grid_size:
+                yield nr, nc
+
+    def component(start_r, start_c):
+        start_idx = start_r * grid_size + start_c
+        start_label = labels[start_idx]
+        stack = [(start_r, start_c)]
+        cells = []
+        visited.add(start_idx)
+
+        while stack:
+            r, c = stack.pop()
+            cells.append((r, c))
+            for nr, nc in neighbors(r, c):
+                nidx = nr * grid_size + nc
+                if nidx in visited or labels[nidx] != start_label:
+                    continue
+                visited.add(nidx)
+                stack.append((nr, nc))
+
+        return start_label, cells
+
+    components = []
+    for row in range(grid_size):
+        for col in range(grid_size):
+            idx = row * grid_size + col
+            if idx in visited:
+                continue
+            components.append(component(row, col))
+
+    comp_by_cell = {}
+    for comp_index, (_, cells) in enumerate(components):
+        for cell in cells:
+            comp_by_cell[cell] = comp_index
+
+    for comp_index, (label, cells) in enumerate(components):
+        if len(cells) > MIN_ISOLATED_REGION_SIZE:
+            continue
+
+        neighbor_score = {}
+        for r, c in cells:
+            for nr, nc in neighbors(r, c):
+                neighbor_comp_index = comp_by_cell.get((nr, nc))
+                if neighbor_comp_index is None or neighbor_comp_index == comp_index:
+                    continue
+                neighbor_label, neighbor_cells = components[neighbor_comp_index]
+                neighbor_score[neighbor_label] = neighbor_score.get(neighbor_label, 0) + len(neighbor_cells)
+
+        if not neighbor_score:
+            continue
+
+        ranked = sorted(neighbor_score.items(), key=lambda item: item[1], reverse=True)
+        best_label, best_score = ranked[0]
+        second_score = ranked[1][1] if len(ranked) > 1 else 0
+        total_score = sum(neighbor_score.values())
+
+        if best_score < CORRECTION_MIN_NEIGHBOR_SUPPORT:
+            continue
+        if total_score == 0 or (best_score / total_score) < CORRECTION_DOMINANCE_RATIO:
+            continue
+        if second_score and best_score < second_score * 1.5:
+            continue
+
+        for r, c in cells:
+            labels[r * grid_size + c] = best_label
+
+    return labels
+
+
 def predict(model, image_array):
     probabilities = model.predict(image_array, verbose=0)[0]
+    predicted_index = int(np.argmax(probabilities))
+    predicted_class = CLASS_NAMES[predicted_index]
+    confidence = float(probabilities[predicted_index]) * 100
+    return predicted_class, confidence, probabilities
+
+
+def classify_from_probabilities(probabilities):
     predicted_index = int(np.argmax(probabilities))
     predicted_class = CLASS_NAMES[predicted_index]
     confidence = float(probabilities[predicted_index]) * 100
@@ -351,6 +604,69 @@ def render_model_switch():
     return selected_name
 
 
+def render_mode_switch():
+    if "selected_mode_name" not in st.session_state:
+        st.session_state.selected_mode_name = "Basic"
+    if "selected_grid_size" not in st.session_state:
+        st.session_state.selected_grid_size = GRID_SIZE_BETA
+
+    mode_keys = list(ANALYSIS_MODES.keys())
+
+    st.markdown(
+        """
+        <div class="switch-card">
+            <div class="switch-header">
+                <div class="switch-icon">🧭</div>
+                <div class="switch-title">Mode Analisis</div>
+            </div>
+            <div class="switch-subtitle">Pilih mode prediksi sebelum unggah citra</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    selected_mode = st.selectbox(
+        "Pilih mode",
+        options=mode_keys,
+        index=mode_keys.index(st.session_state.selected_mode_name)
+        if st.session_state.selected_mode_name in mode_keys
+        else 0,
+    )
+
+    if selected_mode != st.session_state.selected_mode_name:
+        st.session_state.selected_mode_name = selected_mode
+        st.rerun()
+
+    if selected_mode == "Beta":
+        selected_grid_size = st.selectbox(
+            "Ukuran grid",
+            options=GRID_SIZE_CHOICES,
+            index=GRID_SIZE_CHOICES.index(st.session_state.selected_grid_size)
+            if st.session_state.selected_grid_size in GRID_SIZE_CHOICES
+            else GRID_SIZE_CHOICES.index(GRID_SIZE_BETA),
+        )
+        if selected_grid_size != st.session_state.selected_grid_size:
+            st.session_state.selected_grid_size = selected_grid_size
+            st.rerun()
+        grid_note = f"Grid aktif: {selected_grid_size}x{selected_grid_size}"
+    else:
+        grid_note = "Grid aktif: -"
+
+    st.markdown(
+        f"""
+        <div class="active-badge">
+            <span class="dot-active"></span>
+            Mode Aktif: <b>{selected_mode}</b>
+        </div>
+        </div>
+        <div style="margin-top:8px;font-size:0.88rem;color:{PALETTE["muted"]};">{ANALYSIS_MODES[selected_mode]}</div>
+        <div style="margin-top:4px;font-size:0.88rem;color:{PALETTE["muted"]};">{grid_note}</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    return selected_mode
+
+
 
 def main():
     css()
@@ -365,11 +681,13 @@ def main():
         unsafe_allow_html=True,
     )
 
-    left_col, middle_col, right_col = st.columns([1.0, 1.4, 1.0], gap="medium")
+    left_col, middle_col, right_col = st.columns([0.95, 1.2, 1.55], gap="medium")
 
     with left_col:
         # ── Custom pill model switch ──
         selected_model_name = render_model_switch()
+        selected_mode_name = render_mode_switch()
+        selected_grid_size = st.session_state.selected_grid_size
 
         selected_model = MODEL_OPTIONS[selected_model_name]
         model_path = selected_model["path"]
@@ -443,28 +761,75 @@ def main():
             else:
                 preview_image, image_array = processed
                 try:
-                    predicted_class, confidence, probabilities = predict(model, image_array)
+                    if selected_mode_name == "Beta":
+                        probabilities, tile_classes, subtile_counts = predict_grid_average(
+                            model,
+                            preview_image,
+                            grid_size=selected_grid_size,
+                        )
+                        corrected_tile_classes = smooth_tile_classes(
+                            tile_classes,
+                            grid_size=selected_grid_size,
+                        )
+                        annotated_image = make_grid_annotation(
+                            preview_image,
+                            corrected_tile_classes,
+                            grid_size=selected_grid_size,
+                        )
+                        predicted_class, confidence, probabilities = classify_from_probabilities(probabilities)
+                        chart, df = prob_chart(probabilities)
+
+                        st.markdown(
+                            f"""
+                            <div class="card">
+                                <div class="section">Hasil Beta</div>
+                                <div class="result">{predicted_class}</div>
+                                <div style="margin-top:6px;color:{PALETTE["muted"]};">Rata-rata keyakinan tertinggi: <b>{confidence:.2f}%</b></div>
+                                <div style="margin-top:4px;color:{PALETTE["muted"]};">Total input inferensi: <b>{sum(subtile_counts)}</b> tile kecil dari {len(tile_classes)} cell grid</div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+                        st.markdown(f'<div class="hint">{CLASS_INFO[predicted_class]}</div>', unsafe_allow_html=True)
+                        st.image(annotated_image, caption=f"Anotasi grid {selected_grid_size}x{selected_grid_size}", use_container_width=True)
+                        st.markdown('<div class="card" style="margin-top:12px;"><div class="section">Probabilitas Rata-Rata</div></div>', unsafe_allow_html=True)
+                        st.plotly_chart(chart, use_container_width=True)
+                        st.dataframe(df, use_container_width=True, hide_index=True)
+
+                        st.markdown('<div class="card" style="margin-top:12px;"><div class="section">Hasil Tiap Grid</div></div>', unsafe_allow_html=True)
+                        grid_df = pd.DataFrame(
+                            {
+                                "Grid": [f"{idx + 1}" for idx in range(selected_grid_size * selected_grid_size)],
+                                "Kelas": corrected_tile_classes,
+                            }
+                        )
+                        st.dataframe(grid_df, use_container_width=True, hide_index=True)
+                    else:
+                        try:
+                            predicted_class, confidence, probabilities = predict(model, image_array)
+                        except Exception as exc:
+                            st.error(f"Prediksi gagal: {exc}")
+                            return
+
+                        chart, df = prob_chart(probabilities)
+
+                        st.markdown(
+                            f"""
+                            <div class="card">
+                                <div class="section">Hasil Prediksi</div>
+                                <div class="result">{predicted_class}</div>
+                                <div style="margin-top:6px;color:{PALETTE["muted"]};">Confidence tertinggi: <b>{confidence:.2f}%</b></div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+                        st.markdown(f'<div class="hint">{CLASS_INFO[predicted_class]}</div>', unsafe_allow_html=True)
+
+                        st.markdown('<div class="card" style="margin-top:12px;"><div class="section">Probabilitas</div></div>', unsafe_allow_html=True)
+                        st.plotly_chart(chart, use_container_width=True)
+                        st.dataframe(df, use_container_width=True, hide_index=True)
                 except Exception as exc:
-                    st.error(f"Prediksi gagal: {exc}")
-                    return
-
-                chart, df = prob_chart(probabilities)
-
-                st.markdown(
-                    f"""
-                    <div class="card">
-                        <div class="section">Hasil Prediksi</div>
-                        <div class="result">{predicted_class}</div>
-                        <div style="margin-top:6px;color:{PALETTE["muted"]};">Confidence tertinggi: <b>{confidence:.2f}%</b></div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
-                st.markdown(f'<div class="hint">{CLASS_INFO[predicted_class]}</div>', unsafe_allow_html=True)
-
-                st.markdown('<div class="card" style="margin-top:12px;"><div class="section">Probabilitas</div></div>', unsafe_allow_html=True)
-                st.plotly_chart(chart, use_container_width=True)
-                st.dataframe(df, use_container_width=True, hide_index=True)
+                    st.error(f"Analisis gagal: {exc}")
 
     st.markdown(
         '<div class="footer">Aplikasi ini digunakan untuk visualisasi hasil model penelitian klasifikasi kondisi tutupan mangrove berbasis citra drone.</div>',
